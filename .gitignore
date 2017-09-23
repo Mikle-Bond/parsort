@@ -41,6 +41,8 @@
 *.su
 *.idb
 *.pdb
+*.i
+*.s
 
 # Binary input/output files
 *.bin
