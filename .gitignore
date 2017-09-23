@@ -45,3 +45,6 @@
 # Binary input/output files
 *.bin
 
+# YCM config file 
+*.py
+
