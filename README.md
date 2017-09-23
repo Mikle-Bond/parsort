@@ -3,7 +3,7 @@ Parallel sort
 
 This is parallel merge sort using MPI.
 
-##Compiling
+## Compiling
 
 Building main executable can be done like this 
 	
@@ -14,7 +14,7 @@ It doesn't requre anything special, just
 
 	gcc -o conbin conbin.c
 
-##Usage
+## Usage
 
 Due to complications in reading files in MPI, the input files have to be binary.
 The input file should meet this requirements:
