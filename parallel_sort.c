@@ -1,61 +1,33 @@
 /* main.c
  */
-#include <mpi.h>
+#include <omp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <limits.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <string.h>
+
 
 typedef int t_t;
 void heapize(t_t *arr, size_t size);
 void select_big(t_t *f, t_t *s, t_t *t, size_t sz);
 void select_small(t_t *f, t_t *s, t_t *t, size_t sz);
+t_t *mergewrap(t_t *arr, size_t size);
+void mergesort(t_t *arr, t_t *wsp, size_t st, size_t en, char flag);
 
-#if 0 // here is stuff I thought can be helpful
-
-#define max2(x, y) (x ^ ((x ^ y) & -(x < y)))
-#define min2(x, y) (y ^ ((x ^ y) & -(x < y)))
-
-inline static my_log2(int x)
-{
-	// this works for x < 2^24 and uses a hack with floatpoint math
-	typedef union { float f; unsigned u; } t; 
-	
-	// 'm' stands for 'magic constant' and represents 2^23 in float
-	static t m; m.u = 0x4B000000;
-	register t a;
-	
-	// we put x to mantissa of magic constant, and than substract normalized 1.0
-	// that makes the float number to shift mantissa left, till it finds new 1
- 	a.u = x | m.u;
-	a.f -= m.f;
-	
-	// after that exponen becomes 23 - (position of MSB counting from left) + (float bias)
-	// where bias is 0x7F = 128
-	return (a.u >> 23) - 0x7f;
-} 
-
-#endif // 0
+#ifndef MAX_HEAP_SORT
+#define MAX_HEAP_SORT 1000
+#endif // MAX_HEAP_SORT
 
 // debug output
-#define out(r, ...) do{fprintf(stderr, "%d: ", r); fprintf(stderr, ##__VA_ARGS__); fputs("\n", stderr);}while(0)
 #define oint(val) fprintf(stderr, "%s = %d ", #val, val)
+#define ollu(val) fprintf(stderr, "%s = %lu ", #val, val)
+#define out(...) do{ fprintf(stderr, ##__VA_ARGS__); fputs("\n", stderr);}while(0)
+#define fail(...) do{out(__VA_ARGS__); exit(EXIT_FAILURE); }while(0)
 
-// MPI file routine
-#define reed(where, sz) MPI_File_read_shared(ifh, where, sz, MPI_INT, MPI_STATUS_IGNORE)
-#define wrrt(from, sz) MPI_File_write_shared(ofh, from,  sz, MPI_INT, MPI_STATUS_IGNORE)
-
-// MPI send/recieve wrappers
-#define tag(from, to) 0x0FFFFFFF & (((from) << 12) | ((to) & 0xffff)) 
-#define snd(what, sz, to) MPI_Send(what, sz, MPI_INT, to, tag(rank, to), MPI_COMM_WORLD)
-#define rcv(what, sz, to) MPI_Recv(what, sz, MPI_INT, to, tag(to, rank), MPI_COMM_WORLD, MPI_STATUS_IGNORE)
-
-#define fail(...) do{out(__VA_ARGS__); MPI_Abort(MPI_COMM_WORLD, -1); MPI_Finalize(); }while(0)
-
-#if 0
-#define onl puts("")
-#define snd(what, sz, to) warnx("%d: snd (%d->%d), t=%8i", rank, rank, to, tag(rank, to)); dsnd(what, sz, to)
-#define rcv(what, sz, to) warnx("%d: rcv (%d->%d), t=%8i", rank, to, rank, tag(to, rank)); drcv(what, sz, to)
-#endif
+#define print(...) do{ printf(##__VA_ARGS__); fputs("\n", stdout);}while(0)
 
 // debug array dumping
 void dump_arr(t_t *arr, size_t sz) {
@@ -78,212 +50,73 @@ int chk_sorted(t_t *arr, size_t sz) {
 
 int main(int argc, char *argv[])
 {
-	// initialize MPI
-	MPI_Init(&argc, &argv);
-	unsigned rank;
-	unsigned np;
-	MPI_Comm_rank(MPI_COMM_WORLD, (int*)&rank);
-	MPI_Comm_size(MPI_COMM_WORLD, (int*)&np);
-//	warnx("Initialized: %d/%d", rank, np);
-	
 	// get array
-	t_t *frst, *scnd, *thrd;
-	size_t size = 0;
+	t_t *src, *dst;
+	size_t phis_sz = 0;
 
 	if (argc < 3) {
-		fail(rank, "No name to read from, aborting...");
+		fail("Not enough arguments provided, aborting...");
 	}
 
-	MPI_File ifh, ofh;
-	MPI_File_open(MPI_COMM_WORLD, argv[1], MPI_MODE_RDONLY, MPI_INFO_NULL, &ifh);
-	MPI_File_open(MPI_COMM_WORLD, argv[2], MPI_MODE_CREATE|MPI_MODE_WRONLY, MPI_INFO_NULL, &ofh);
+	int ifh, ofh;
+	ifh = open(argv[1], O_RDONLY, NULL);
+	ofh = open(argv[2], O_WRONLY | O_CREAT, 0644);
+	if (ifh < 0 || ofh < 0)
+		fail("Cant open files");
 
-	if (rank == 0) {
-		// first process reads size form file
-		reed(&size, 1);
-	} else {
-		// ... and the others will get it one-by-one
-		rcv(&size, 1, rank - 1);
-	}
+	if (0 > read(ifh, &phis_sz, sizeof(int)))
+		fail("Can't read from file");
 
-	size_t part_sz = size / np + !!(size % np); // this might be bigger then needed
-	size_t real_sz = size / np + !!(rank < (size % np)); // used only after sorting
+	printf(	"OpenMP Merge sort\n"
+		"=================\n"
+		"\n"
+		"Input file: \t%s\n"
+		"Output file: \t%s\n"
+		"Array size: \t%lu \n"
+		"\n", 
+		argv[1], argv[2], phis_sz);
+
+	src = (t_t *)malloc(sizeof(*src) * phis_sz);
+	dst = (t_t *)malloc(sizeof(*dst) * phis_sz);
+	if (!src || !dst) 
+		fail("Can't allocate memory");
+
+	if (0 > read(ifh, src, sizeof(*src) * phis_sz))
+		fail("Can't read array");
 	
-	frst = (t_t *)malloc(sizeof(*frst) * part_sz);
-	scnd = (t_t *)malloc(sizeof(*scnd) * part_sz);
-	thrd = (t_t *)malloc(sizeof(*thrd) * part_sz);
+	double timer = omp_get_wtime();
 
-	if (!(frst && scnd && thrd)) {
-		fail(rank, "Allocation failure");
-	}
-	
-//	warnx("%d: allocation successful, part_sz = %d", rank, part_sz);
-	if (part_sz > real_sz)
-		frst[real_sz] = INT_MAX;
+#pragma omp parallel shared(src, dst, phis_sz)
+#pragma omp single nowait
+{
+	mergesort(src, dst, 0, phis_sz, 0);
+}
 
-	reed(frst, real_sz);
+	timer = omp_get_wtime() - timer;
 
-	//out(rank, "scanf:"), dump_arr(frst, part_sz);
-	
-	if (rank != np - 1) {
-		snd(&size, 1, rank + 1);
-	}
-MPI_Barrier(MPI_COMM_WORLD);
-	
-	double timer = MPI_Wtime();
-
-	// sort part
-	heapize(frst, part_sz);
-//	warnx("%d: sort done, checking", rank);
-//	if (chk_sorted(frst, part_sz))
-//		out(rank, "sort successful");
-//	else
-//		MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
-
-	unsigned mask = 0x1;
-	unsigned to;
-	t_t *t = NULL;
-	#define swp(a, b) t = a, a = b, b = t
-	while(mask < np) {
-		// first iteration, one half treated as reversed
-		unsigned mext = (mask | (mask-1)); // mask extended with 1 til right corner
-		to = (rank & ~mext) | (mext & ~rank); // rank with reversed tail
-		if (to < np) {
-		//	oint(mask); oint(rank), oint(to); out(rank, " rev comp");
-			if (to > rank) {
-				snd(frst, part_sz, to);
-				rcv(scnd, part_sz, to);
-				select_small(frst, scnd, thrd, part_sz);
-			} else {
-				rcv(scnd, part_sz, to);
-				snd(frst, part_sz, to);
-				select_big(frst, scnd, thrd, part_sz);
-			}
-
-			swp(thrd, frst);
-		}
-	//	if (chk_sorted(frst, part_sz))
-	//		out(rank, "sort successful after (%d, %d)", rank, to);
-
-//	MPI_Barrier(MPI_COMM_WORLD);
-		unsigned m = mask;
-		while (m >>= 1) {
-			to = rank ^ m;
-			if (to >= np)
-				continue;
-
-		//	oint(mask); oint(m); oint(rank), oint(to); out(rank, "norm comp");
-			if (to > rank) {
-				snd(frst, part_sz, to);
-				rcv(scnd, part_sz, to);
-				select_small(frst, scnd, thrd, part_sz);
-			} else {
-				rcv(scnd, part_sz, to);
-				snd(frst, part_sz, to);
-				select_big(frst, scnd, thrd, part_sz);
-			}
-			swp(thrd, frst);
-	//		if (chk_sorted(frst, part_sz))
-	//			out(rank, "sort successful after (%d, %d)", rank, to);
-
-//		MPI_Barrier(MPI_COMM_WORLD);
-		}
-		mask <<= 1;
-	}
-	#undef swp
-
-MPI_Barrier(MPI_COMM_WORLD);
-	timer = MPI_Wtime() - timer;
-
-	out(rank, "bitonic sort completed");
-	if (!rank) 
-		out(rank, "timelaps: %lg", timer);
+	out("Sort completed");
+	out("Timelaps: %lg", timer);
 
 	// check
-	if (chk_sorted(frst, part_sz))
-		out(rank, "Inner sort passed");
+	if (chk_sorted(dst, phis_sz))
+		out("Sort check passed");
 	else
-		out(rank, "FAILURE: disorder inside part");
+		out("FAILURE: disorder detected");
 	
-	// recalc amount of real elements for output 
-	if (rank < size / part_sz) {
-		real_sz = part_sz;
-	} else if (rank == size / part_sz) {
-		real_sz = size % part_sz;
-	} else {
-		real_sz = 0;
-	}
+	if (0 > write(ofh, dst, sizeof(int) * phis_sz))
+		fail("Couldn't write to file");
 
-
-	// Get last element of previous part
-	t_t i = 0;
-	if (rank == 0)
-		i = INT_MIN;
-	else
-		rcv(&i, 1, rank - 1);
-
-	if (i > frst[0]) {
-		out(rank, "FAILURE: disorder between parts: %d on previous, %d here", i, frst[0]);
-	} else {
-		out(rank, "Inbetween sort passed");
-	}
-
-	// dump_arr(frst, part_sz);
-	if (real_sz)
-		wrrt(frst, real_sz);
+	close(ifh);
+	close(ofh);
 	
-	if (rank != np - 1)
-		snd(frst + part_sz - 1, 1, rank + 1);
+	free(src);
+	free(dst);
 
-	
-	free(frst);
-	free(scnd);
-	free(thrd);
-
-	MPI_File_close(&ifh);
-	MPI_File_close(&ofh);
-
-	MPI_Finalize();
 	return 0;
 }
 
-void select_small(t_t *f, t_t *s, t_t *t, size_t sz) 
-{
-	size_t i;
-
-	for (i = 0; i < sz; i += 1) {
-		if (*f < *s) {
-			*t = *f;
-			++f;
-		} else {
-			*t = *s;
-			++s;
-		}
-		++t;
-	}
-}
-
-void select_big(t_t *f, t_t *s, t_t *t, size_t sz) 
-{
-	size_t i;
-	f += sz - 1;
-	s += sz - 1;
-	t += sz - 1;
-
-	for (i = 0; i < sz; i += 1) {
-		if (*f > *s) {
-			*t = *f;
-			--f;
-		} else {
-			*t = *s;
-			--s;
-		}
-		--t;
-	}
-}
-
 // selects max in tree-like structure
-inline int maxarr3(t_t *arr, int p)
+int maxarr3(t_t *arr, int p)
 {
 	register int l = 2 * p;
 	register int r = l + 1;
@@ -291,7 +124,7 @@ inline int maxarr3(t_t *arr, int p)
 	return (arr[l] > arr[p] ? l : p); 
 }
 
-inline void swap(t_t *arr, int i, int j)
+void swap(t_t *arr, int i, int j)
 {
 	t_t t = arr[i]; arr[i] = arr[j]; arr[j] = t;
 }
@@ -355,4 +188,66 @@ void heapize(t_t *arr, size_t size)
 	}
 }
 
+void merge2(t_t *f, size_t s, size_t m, size_t e, t_t *t)
+{
+	size_t i = m;
+	while (s < m && i < e)
+		*t++ = (f[s] < f[i] ? f[s++] : f[i++]);
+	while (s < m)
+		*t++ = f[s++];
+	while (i < e)
+		*t++ = f[i++];
+}
+
+void mergesort(t_t *arr, t_t *wsp, size_t st, size_t en, char flag) 
+{
+	// out("sorting from %lu to %lu (flag = %d)", st, en, flag);
+	if (en <= 1 + st) {
+		return;
+	} else if ((en - st) < MAX_HEAP_SORT && flag) {
+//		#pragma omp task
+		heapize(wsp + st, en - st);
+	} else {
+		size_t mid = (st + en) / 2;
+		/* 
+		 * Ok, this part is tricky.
+		 *
+		 * To use O(n) extra memory this function takes two arrays, instead of one.
+		 * arr -- is array with input data, and wsp -- output array.
+		 *
+		 * But inside mergesort they will swap their roles with the depth of call.
+		 * E.g. in the initial call (depth == 0) wsp will be merged from halfs, stored in arr;
+		 * and halfs in arr (depth == 1) will be merged from quorters, stored in wsp; and so on.
+		 *
+		 * On the lowest layer, heapsort is used. The flag argument shows 
+		 * where actual data is stored on the way down.
+		 */
+		#pragma omp task
+		mergesort(wsp, arr, st, mid, !flag);
+		#pragma omp task
+		mergesort(wsp, arr, mid, en, !flag);
+		#pragma omp taskwait
+		merge2(arr, st, mid, en, wsp + st);
+	}
+
+	/*
+	 * if (!chk_sorted(wsp + st, en - st)) {
+	 *         out("------------------------\nsomething went wrong");
+	 *         ollu(st), ollu(en);
+	 *         dump_arr(wsp + st, en - st);
+	 *         fail("stopping");
+	 * } else {
+	 *         out("midcheck passed %lu - %lu", st, en);
+	 * }
+	 */
+}
+
+t_t *mergewrap(t_t *arr, size_t size)
+{
+	t_t *wsp = (t_t *)malloc(size * sizeof(t_t));
+	#pragma omp parallel
+	#pragma omp single nowait
+	mergesort(arr, wsp, 0, size, 0);
+	return wsp;
+}
 
